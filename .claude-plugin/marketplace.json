@@ -5,14 +5,14 @@
   },
   "metadata": {
     "description": "Android device orchestration for concurrent coding agents",
-    "version": "0.2.0"
+    "version": "0.3.0"
   },
   "plugins": [
     {
       "name": "devlease",
       "source": "./",
       "description": "Leases each Android device and emulator to one agent at a time, so concurrent agents cannot install over each other's build or drive the same UI.",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "author": {
         "name": "ubuntudroid"
       },
