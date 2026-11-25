@@ -257,6 +257,123 @@ check "global op inside bash -c is still refused" \
 reset
 check "an unparseable command naming a device tool is refused" \
   "$(hook A "adb -s emulator-5554 shell echo it's")" deny "parse"
+check "an unparseable command with a tool right after ( is refused" \
+  "$(hook A $'X=$(adb -s emulator-5554 shell echo it\'s)')" deny "parse"
+check "an unparseable command with a tool right after ; is refused" \
+  "$(hook A $'true;adb shell echo it\'s')" deny "parse"
+
+# --- separators without spaces, newlines and substitutions still end a command ---
+leased() { # leased <desc>: the last hook call took the emulator-5554 lease
+  [ -d "$DEVLEASE_DIR/emulator-5554" ] && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: $1"; }
+}
+unleased() { # unleased <desc>: no hook call took the emulator-5554 lease
+  [ -d "$DEVLEASE_DIR/emulator-5554" ] && { fail=$((fail+1)); echo "FAIL: $1"; } || pass=$((pass+1))
+}
+reset; hook A $'cd app\nadb -s emulator-5554 shell ls' >/dev/null
+leased "a device command on the next line is gated"
+reset; hook A 'cd app&&adb -s emulator-5554 shell ls' >/dev/null
+leased "a device command after && without spaces is gated"
+check "a global op after ; without a space is refused" "$(hook A 'true;adb kill-server')" deny "other agents"
+reset; hook A 'echo $(adb -s emulator-5554 shell ls)' >/dev/null
+leased "a device command in \$( ) is gated"
+reset; hook A 'diff <(adb -s emulator-5554 shell ls) expected.txt' >/dev/null
+leased "a device command in <( ) is gated"
+reset
+check "a continued line keeps its arguments" \
+  "$(hook A $'./gradlew installDebug \\\n  -Pdevice=emulator-5554')" allow
+leased "a continued line keeps its arguments"
+reset; hook A '>log 2>&1 adb -s emulator-5554 shell ls' >/dev/null
+leased "a device command after leading redirections is gated"
+reset
+check "a redirection target named like a tool is not a command" "$(hook A 'echo hi > adb')" allow
+reset
+check "a quoted word starting with < is not a redirection" \
+  "$(hook A './gradlew installDebug "<x>" -Pdevice=emulator-5554')" allow
+leased "a quoted word starting with < kept the device argument after it"
+check "a global op after do is refused" "$(hook A 'while true; do adb kill-server; done')" deny "other agents"
+reset; hook A 'if adb -s emulator-5554 shell true; then echo ok; fi' >/dev/null
+leased "a device command after if is gated"
+
+# --- heredoc bodies are data, not commands ---
+reset
+check "a heredoc body is not gated" \
+  "$(hook A $'cat > run.sh <<\'EOF\'\nadb kill-server\nadb -s emulator-5554 install app.apk\nEOF')" allow
+unleased "a heredoc body took a lease"
+check "an apostrophe in a heredoc body does not make the command unparseable" \
+  "$(hook A $'git commit -F - <<EOF\nDon\'t race adb kill-server\nEOF')" allow
+check "the command after a heredoc is gated" \
+  "$(hook A $'cat <<EOF\nnotes\nEOF\nadb kill-server')" deny "other agents"
+reset
+check "a <<- heredoc ends at a tab-indented terminator" \
+  "$(hook A $'cat <<-EOF\n\tadb kill-server\n\tEOF\nadb -s emulator-5554 shell ls')" allow
+leased "the command after a <<- heredoc is gated"
+check "a here-string is not a heredoc" \
+  "$(hook A $'cat <<<"adb kill-server"\nadb kill-server')" deny "other agents"
+check "a <<WORD that no WORD line closes is not a heredoc" \
+  "$(hook A $'grep -n \'<<EOF\' x.sh\ntrue && adb kill-server')" deny "other agents"
+check "an arithmetic shift is not a heredoc" \
+  "$(hook A $'echo $((1<<n))\nadb kill-server')" deny "other agents"
+check "a <<WORD in a comment is not a heredoc" \
+  "$(hook A $'# feed it via <<EOF\nadb kill-server')" deny "other agents"
+reset
+check "an apostrophe in a comment line does not make the command unparseable" \
+  "$(hook A $'# Don\'t reinstall\nadb -s emulator-5554 shell ls')" allow
+leased "the command after a comment line is gated"
+check "a <<\\EOF heredoc body is not gated" \
+  "$(hook A $'cat <<\\EOF > s.sh\nadb kill-server\nEOF')" allow
+check "a heredoc with a numeric delimiter is not gated" \
+  "$(hook A $'cat <<123 > s.sh\nadb kill-server\n123')" allow
+check "a continuation in a quoted heredoc does not swallow its terminator" \
+  "$(hook A $'cat > x.sh <<\'EOF\'\necho a \\\nEOF\nadb kill-server')" deny "other agents"
+check "a word continued across lines is joined" \
+  "$(hook A $'ad\\\nb kill-server')" deny "other agents"
+
+# --- quoted substitutions, time, joined operators, numeric serials, keyword-named paths ---
+reset; hook A 'PID="$(adb -s emulator-5554 shell pidof x)"' >/dev/null
+leased "a device command in a quoted \$( ) is gated"
+check "a device command in backticks is gated" "$(hook A 'echo `adb kill-server`')" deny "other agents"
+reset; hook A 'time ./gradlew connectedDebugAndroidTest -Pdevice=emulator-5554' >/dev/null
+leased "a device command after time is gated"
+check "a device command after time -p is gated" "$(hook A 'time -p adb kill-server')" deny "other agents"
+check "a separator joined to a redirection still ends the command" \
+  "$(hook A 'true;>log adb kill-server')" deny "other agents"
+check "a process substitution joined to another is still gated" \
+  "$(hook A 'diff <(true)<(adb kill-server)')" deny "other agents"
+reset; hook A 'adb -s 12345 >log shell ls' >/dev/null
+[ -d "$DEVLEASE_DIR/12345" ] && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: a numeric serial before a redirection was lost"; }
+check "a script named like a keyword is not a keyword" "$(hook A './scripts/do adb kill-server')" allow
+reset; hook A $'X=$(adb -s emulator-5554 shell getprop)  # don\'t cache' >/dev/null
+leased "an apostrophe in a trailing comment does not hide the command"
+check "a ; in a trailing comment is not a separator" "$(hook A 'echo hello # example; adb kill-server')" allow
+check "a # inside a word is not a comment" "$(hook A 'curl http://x/#/a;adb kill-server')" deny "other agents"
+check "an escaped \$( ) in double quotes is text" "$(hook A 'echo "\$(adb kill-server)"')" allow
+check "an escaped backslash before \$( ) still runs it" "$(hook A 'echo "\\\\$(adb kill-server)"')" deny "other agents"
+reset
+check "a backtick span in single quotes is text" \
+  "$(hook A "gh pr comment 2 --body 'Run \`adb -s emulator-5554 install x.apk\` first'")" allow
+unleased "a backtick span in single quotes took a lease"
+check "a \$( ) in single quotes is text" "$(hook A "echo '\$(adb kill-server)'")" allow
+check "apostrophes in nested quotes do not hide a \$( ) between them" \
+  "$(hook A $'echo "$(echo "it\'s")" "$(adb kill-server)" "$(echo "can\'t")"')" deny "other agents"
+reset; hook A $'PID="$(adb -s emulator-5554 shell ps | grep -E \'(foo|bar)\')"' >/dev/null
+leased "a quoted \$( ) with parentheses inside is gated"
+check "a comment line after a continuation still ends the command" \
+  "$(hook A $'echo a \\\n# note\nadb kill-server')" deny "other agents"
+
+# --- ctx_execute code: only shell code is read as shell ---
+ctx() { # ctx <language> <code>
+  python3 -c '
+import json,sys
+print(json.dumps({"session_id":"A","cwd":"/tmp/wt",
+  "tool_name":"mcp__plugin_context-mode_context-mode__ctx_execute",
+  "tool_input":{"language":sys.argv[1],"code":sys.argv[2]}}))' "$1" "$2" | "$DEVLEASE" hook
+}
+reset; ctx shell 'adb -s emulator-5554 shell ls' >/dev/null
+leased "ctx_execute shell code is gated"
+reset
+check "ctx_execute python code is not read as shell" \
+  "$(ctx python $'import shutil\nadb = shutil.which("adb")\nprint(adb)')" allow
+unleased "ctx_execute python code took a lease"
 
 # --- batch tool input shape ---
 reset

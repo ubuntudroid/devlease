@@ -37,9 +37,23 @@ GRADLE_TASK = re.compile(r"^(?:install|uninstall|connected)")
 
 # Commands that run another command, so the real target is further along.
 WRAPPERS = {"env", "timeout", "gtimeout", "nice", "nohup", "stdbuf", "sudo",
-            "command", "xargs"}
+            "command", "xargs", "time", "exec"}
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
-OPERATORS = {"|", "||", "&&", ";", "&", "(", ")", "{", "}", "!", "\n"}
+KEYWORDS = {"if", "then", "elif", "else", "while", "until", "do"}
+OPERATORS = {"|", "||", "&&", ";", ";;", "&", "(", ")", "{", "}", "!", "\n", "<(", ">("}
+# shlex keeps a run of these together (`;>`, `&&\n`), so OPERATOR splits the run.
+PUNCTUATION = "();<>|&\n"
+OPERATOR = re.compile(r"[<>]\(|&?[<>][<>&|]*|&&|\|\||;;|[();|&\n]")
+# A redirection operator once split out: `>`, `>>`, `<`, `>&`, `&>`, `<<<`, `>|`.
+REDIRECT = re.compile(r"^&?[<>][<>&|]*$")
+# `<<WORD`, `<<-WORD`, `<<\WORD`, `<< 'WORD'`, `<<"WORD"`, but not the here-string `<<<`.
+HEREDOC = re.compile(r"(?<!<)<<(?!<)(-?)\s*\\?(['\"]?)(\w[\w.-]*)\2")
+SUBSTITUTION = re.compile(r"\$\(((?:[^()]|\([^()]*\))*)\)|`([^`]*)`")
+# A '…' holding a `"` may be a mispaired apostrophe, so it stays and is gated.
+LITERAL = re.compile(r"""\\.|"(?:\\.|[^"\\])*"|'[^'"]*'""", re.S)
+# An unquoted `#` at a word start comments out the line; one holding `"`, `` ` `` or `)`
+# may sit in a nested quote this cannot see, so it is kept and gated.
+COMMENT = re.compile(r"""\\.|"(?:\\.|[^"\\])*"|'[^']*'|(?<!\S)#[^\n"`)]*$""", re.S | re.M)
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 WRAPPER_ARG = re.compile(r"^-|^[\d.]+[smhd]?$")
 
@@ -93,23 +107,75 @@ def segments(cmd, depth=0):
     script that mentions adb — is an argument, not a command, and must not be
     gated. Returns None if the command cannot be parsed.
     """
+    text = COMMENT.sub(lambda m: "" if m[0][0] == "#" else m[0], drop_heredoc_bodies(cmd))
+    # The shell drops a `\` and newline pair, so `ad\⏎b` is `adb`.
+    # ponytail: this also joins after an escaped `\\`, where the shell keeps the newline.
+    text = text.replace("\\\n", "")
     try:
-        tokens = shlex.split(cmd, posix=True)
+        lexer = shlex.shlex(text, posix=True, punctuation_chars=PUNCTUATION)
+        # Newlines end commands, as `;` does, so they are punctuation, not whitespace.
+        lexer.whitespace_split, lexer.commenters, lexer.whitespace = True, "", " \t\r"
+        tokens = list(lexer)
     except ValueError:
         return None
+    out = []
+    if depth < 4:
+        # The shell runs "$( … )" and backticks inside double quotes, not single or escaped ones.
+        unquoted = LITERAL.sub(lambda m: "" if m[0][0] == "'" else re.sub(r"\\.", "", m[0]), text)
+        for dollar, backtick in SUBSTITUTION.findall(unquoted):
+            out.extend(segments(dollar or backtick, depth + 1) or [])
     groups, current = [], []
     for token in tokens:
-        if token in OPERATORS:
-            if current:
-                groups.append(current)
-            current = []
-        else:
-            current.append(token)
+        # ponytail: shlex drops quotes, so a quoted "&&" or ";" splits too; that fails closed.
+        pieces = OPERATOR.findall(token) if token and set(token) <= set(PUNCTUATION) else [token]
+        for piece in pieces:
+            if piece in OPERATORS:
+                if current:
+                    groups.append(current)
+                current = []
+            else:
+                current.append(piece)
     if current:
         groups.append(current)
-    out = []
     for group in groups:
-        out.extend(_simple(group, depth))
+        out.extend(_simple(drop_redirections(group), depth))
+    return out
+
+
+def drop_heredoc_bodies(cmd):
+    """cmd without heredoc bodies, comment lines blanked: both are data, not commands.
+
+    An unclosed `<<WORD` (in quotes, `$((1<<n))`) was no heredoc: cmd comes back whole.
+    ponytail: no quote tracking, so a quoted `<<WORD` a later WORD line closes, a `#` line
+    in a multi-line quote, and a `$( … )` in an unquoted body can each hide a command.
+    """
+    kept, pending = [], []
+    for line in cmd.split("\n"):
+        if pending:
+            strip_tabs, word = pending[0]
+            if (line.lstrip("\t") if strip_tabs else line) == word:
+                pending.pop(0)
+            continue
+        if line.lstrip().startswith("#"):
+            line = ""  # not dropped: a `\` above it must not join the line below
+        kept.append(line)
+        pending = [(dash == "-", word) for dash, _, word in HEREDOC.findall(line)]
+    return cmd if pending else "\n".join(kept)
+
+
+def drop_redirections(tokens):
+    """tokens as the program receives them: the shell removes `>log`, `2>&1`, `<in`."""
+    out, skip = [], False
+    for token in tokens:
+        if skip:
+            skip = False
+        elif REDIRECT.match(token):
+            # ponytail: `2>&1` splits into `2`, `>&`, `1`, so `echo 2 >x` loses its `2` too.
+            if out and len(out[-1]) == 1 and out[-1].isdigit():
+                out.pop()
+            skip = True  # the target is the next word
+        else:
+            out.append(token)
     return out
 
 
@@ -123,6 +189,9 @@ def _simple(tokens, depth):
         return []
     written, args = tokens[0], tokens[1:]
     name = os.path.basename(written)
+
+    if written in KEYWORDS and depth < 4:
+        return _simple(args, depth + 1)
 
     if name in WRAPPERS and depth < 4:
         rest = args
@@ -144,23 +213,6 @@ def _simple(tokens, depth):
                 return nested
 
     return [(written, name, args, assignments)]
-
-
-# A redirection, alone (`>`, `2>`) or with its target attached (`>/dev/null`, `2>&1`).
-REDIRECT = re.compile(r"^\d*(?:>>?|<|&>|>&|<&)")
-
-
-def without_redirects(args):
-    """args as the program receives them: the shell removes redirections first."""
-    words, skip = [], False
-    for arg in args:
-        if skip:
-            skip = False
-        elif REDIRECT.match(arg):
-            skip = REDIRECT.fullmatch(arg) is not None  # the target is the next word
-        else:
-            words.append(arg)
-    return words
 
 
 def is_global(name, args):
@@ -293,7 +345,7 @@ def acquire(serial, cwd):
         return True, notice
 
 
-DEVICE_TOOLS = re.compile(r"(?:^|[\s/\"'])(?:adb|maestro|gradlew|android)(?:\s|$)")
+DEVICE_TOOLS = re.compile(r"(?:^|[\s/\"'(;&|`])(?:adb|maestro|gradlew|android)(?:[\s);&|`]|$)")
 
 
 def gate(cmd, cwd, alone=True):
@@ -322,8 +374,7 @@ def gate(cmd, cwd, alone=True):
                     "releases before any of the command runs, so anything chained with "
                     "it would run on a device you no longer hold."
                 )
-            words = without_redirects(args[1:])
-            target = words[0] if words else None
+            target = args[1] if len(args) > 1 else None
             freed = release(ME, target)
             notices.append(
                 f"Released {', '.join(freed)}." if freed else
@@ -390,7 +441,8 @@ def hook():
         return
 
     commands = []
-    for key in ("command", "code"):
+    shell = tool_input.get("language", "shell") in SHELLS | {"shell"}
+    for key in ("command", "code") if shell else ("command",):
         if isinstance(tool_input.get(key), str):
             commands.append(tool_input[key])
     # context-mode v1 batches send {"label", "command"} objects, v2 plain strings.
